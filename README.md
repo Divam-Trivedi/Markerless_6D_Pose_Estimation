@@ -206,9 +206,10 @@ Key configuration files to modify based on your setup:
 
 *(To be added)*
 
+
 ## Acknowledgements
 
-*(To be added)*
+This project was developed by **Divam Trivedi** at the **Human-Inspired Robotics Lab (HiRO)** at Worcester Polytechnic Institute (WPI).
 
 ## License
 
@@ -218,10 +219,7 @@ This project builds upon:
 
 Please refer to their respective licenses for usage terms.
 
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
 ## Contact
 
-For questions and support, please open an issue in the repository.
+**Divam Trivedi**  
+dtrivedi@wpi.edu
