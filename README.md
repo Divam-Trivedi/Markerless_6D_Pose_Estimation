@@ -204,7 +204,7 @@ Key configuration files to modify based on your setup:
 
 ## 📊 Results
 
-[![Results Demo](assets/results_demo.gif)]
+![Results Demo(assets/results_demo.gif)]
 
 Pose estimation results using Detectron2 for object detection and FoundationPose for 6D pose tracking.
 
