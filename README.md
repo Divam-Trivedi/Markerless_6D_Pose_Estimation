@@ -65,7 +65,7 @@ pip install setuptools==69.5.1
 ### 5. Build C++ Extensions
 
 ```bash
-CMAKE_PREFIX_PATH=$CONDA_PREFIX/lib/python3.9/site-packages/pybind11/share/cmake/pybind11 bash build_all_conda.sh
+CMAKE_PREFIX_PATH="$(python -c 'import pybind11, pathlib; print(pathlib.Path(pybind11.get_cmake_dir()))')" bash build_all_conda.sh
 ```
 
 > **Important**: After running this command, a new `mycpp` folder will be created inside the `FoundationPose` directory. Copy this folder to your project root directory.
