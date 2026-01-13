@@ -1,6 +1,11 @@
-import cv2, numpy as np, os, pathlib, sys, json
+import cv2, numpy as np, os, pathlib, sys, time
 import logging
 from collections import defaultdict
+import mediapipe
+import pyrender
+import trimesh
+import datetime
+from scipy.spatial.transform import Rotation as R
 
 # persistence threshold (change to 3 or 5)
 PERSISTENCE_THRESHOLD = 10
@@ -13,7 +18,7 @@ DEPTH_MATCH_THRESHOLD_M = 0.06  # 6 cm tolerance
 YELLOW = (0, 255, 255)
 GREEN  = (0, 255, 0)
 
-# sys.path.append(f'/home/hirolab/divam/FoundationPose/FoundationPose')
+# sys.path.append(f'/home/hirolab/divam/ros2_ws/src/pose_pkg/Markerless_6D_Pose_Estimation')
 from estimater import *
 from datareader import *
 from FP_Utils import *
@@ -94,7 +99,6 @@ def estimate_pose(frames_rgb, frames_depth, masks_per_frame, detected_objects,
 
     K = intrinsics["K"]
     MM_PER_UNIT = intrinsics.get("MM_PER_UNIT", 1.0)
-    MM_PER_UNIT = 1.0000000474974513
 
     poses_per_frame = defaultdict(dict)
     meshes_in_use = {}
@@ -121,8 +125,8 @@ def estimate_pose(frames_rgb, frames_depth, masks_per_frame, detected_objects,
 
     # ---------- 3. Process each frame ----------
     for frame_idx, (rgb_frame, depth_frame, mask_dict) in enumerate(
-        zip(frames_rgb, frames_depth, masks_per_frame)
-    ):
+            zip(frames_rgb, frames_depth, masks_per_frame)
+        ):
         depth_m = depth_frame.astype(np.float32) * MM_PER_UNIT / 1000.0
 
         for instance_id in valid_objects:
@@ -144,21 +148,6 @@ def estimate_pose(frames_rgb, frames_depth, masks_per_frame, detected_objects,
                         ob_mask=mask,
                         iteration=5
                     )
-                    ## POSE CORRECTION
-                    # theta = np.deg2rad(-90)
-                    # Rz = np.array([
-                    #     [np.cos(theta), -np.sin(theta), 0],
-                    #     [np.sin(theta),  np.cos(theta), 0],
-                    #     [0, 0, 1]
-                    # ])
-                    # R_old = pose[:3, :3]
-                    # t_old = pose[:3, 3]
-                    # # Rotate around LOCAL Z axis → post-multiply
-                    # R_new = R_old @ Rz
-                    # T_rotated = np.eye(4)
-                    # T_rotated[:3, :3] = R_new
-                    # T_rotated[:3, 3]  = t_old
-                    # pose = T_rotated.copy()
                     poses_per_frame[0][instance_id] = np.array(pose, dtype=np.float64)
                     print(f"[estimate_pose] Registered {instance_id} successfully.")
                 except Exception as e:
@@ -171,24 +160,8 @@ def estimate_pose(frames_rgb, frames_depth, masks_per_frame, detected_objects,
                     rgb=rgb_frame,
                     depth=depth_m,
                     K=K,
-                    iteration=2
+                    iteration=5
                 )
-                ## POSE CORRECTION
-                # theta = np.deg2rad(-90)
-                # Rz = np.array([
-                #     [np.cos(theta), -np.sin(theta), 0],
-                #     [np.sin(theta),  np.cos(theta), 0],
-                #     [0, 0, 1]
-                # ])
-                # R_old = pose[:3, :3]
-                # t_old = pose[:3, 3]
-                # # Rotate around LOCAL Z axis → post-multiply
-                # R_new = R_old @ Rz
-                # T_rotated = np.eye(4)
-                # T_rotated[:3, :3] = R_new
-                # T_rotated[:3, 3]  = t_old
-                # pose = T_rotated.copy()
-
                 poses_per_frame[frame_idx][instance_id] = np.array(pose, dtype=np.float64)
             except Exception as e:
                 print(f"[estimate_pose] Tracking failed for {instance_id} on frame {frame_idx}: {e}")
@@ -196,139 +169,148 @@ def estimate_pose(frames_rgb, frames_depth, masks_per_frame, detected_objects,
 
     return poses_per_frame, meshes_in_use
 
+def save_combined_results_ros(frames_rgb, frames_depth, masks_per_frame,
+                              poses_per_frame, meshes_in_use, K, MM_PER_UNIT, ROOT):
 
-def save_combined_results_ros(frames_rgb, masks_per_frame, poses_per_frame, meshes_in_use, K, ROOT):
-    """
-    ROS2 version: visualize in memory only (publish via topic), no GUI or image saving.
-    Still writes output_results.txt for poses.
-    Returns list of annotated images for potential publishing.
-    """
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_root = ROOT / f"output_{timestamp}"
     out_root.mkdir(parents=True, exist_ok=True)
 
+    annotated_frames = []
+    results_lines = [f"Saved on {datetime.datetime.now().isoformat()}\n\n"]
+
     num_frames = len(frames_rgb)
-    annotated_frames = []  # will store annotated RGB for ROS publishing
+    all_poses = {}  # obj_name -> list of poses
+    for fi in range(num_frames):
+        frame_rgb = frames_rgb[fi]
+        frame_depth = frames_depth[fi].astype(np.float32) * MM_PER_UNIT / 1000.0
+        masks = masks_per_frame[fi]
+        poses = poses_per_frame.get(fi, {})
 
-    for i in range(num_frames):
-        frame = frames_rgb[i].copy()
-        mask_dict = masks_per_frame[i]
-        vis = frame.copy()
+        results_lines.append(f"Frame {fi}:\n")
 
-        # Overlay masks (light)
-        for obj_name, mask in mask_dict.items():
-            color = tuple(np.random.randint(0, 255, 3).tolist())
-            mask_3ch = np.zeros_like(vis)
-            mask_3ch[mask > 0] = color
-            vis = cv2.addWeighted(vis, 1.0, mask_3ch, 0.35, 0)
+        mesh_img = frame_rgb.copy()
+        axes_img = frame_rgb.copy()
+        mask_img = frame_rgb.copy()
 
-        # Draw meshes + axes (optional)
-        for obj_name, pose in poses_per_frame.get(i, {}).items():
-            mesh = meshes_in_use.get(obj_name, None)
-            if mesh is None:
+        for obj_name, pose in poses.items():
+            mesh = meshes_in_use.get(obj_name)
+            mask = masks.get(obj_name)
+            if obj_name not in all_poses:
+                all_poses[obj_name] = []
+
+
+            if mesh is None or mask is None:
                 continue
 
+            h, w = frame_rgb.shape[:2]
             color = tuple(np.random.randint(0, 255, 3).tolist())
 
-            # draw XYZ axes at object pose
-            vis = draw_xyz_axis(vis, ob_in_cam=pose, scale=0.1, K=K, thickness=3)
+            mask_3ch = np.zeros_like(mask_img)
+            mask_3ch[mask > 0] = color
+            mask_img = cv2.addWeighted(mask_img, 1.0, mask_3ch, 0.4, 0)
 
-            # project mesh with object color
             m = mesh.copy()
             m.apply_transform(pose)
-            projected = (K @ m.vertices.T).T
-            z = projected[:, 2:3]
+            proj = (K @ m.vertices.T).T
+            z = proj[:, 2:3]
             z[z == 0] = 1e-6
-            projected[:, :2] /= z
-            pts_2d = projected[:, :2].astype(np.int32)
+            proj[:, :2] /= z
+            pts_2d = proj[:, :2].astype(np.int32)
 
             for tri in m.faces:
-                pts = pts_2d[tri]
-                cv2.polylines(vis, [pts], isClosed=True, color=color, thickness=2)
+                cv2.polylines(mesh_img, [pts_2d[tri]], True, color, 2)
 
-            # Label object
-            mask = mask_dict.get(obj_name, None)
-            if mask is not None:
-                ys, xs = np.where(mask > 0)
-                if len(ys) > 0:
-                    cv2.putText(vis, obj_name, (xs[0], ys[0]-8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-            else:
-                cv2.putText(vis, obj_name, (10, 40 + 25 * list(poses_per_frame[i]).index(obj_name)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            # -90 deg rotation about X (object frame)
+            T_rx = np.eye(4, dtype=np.float32)
+            T_rx[:3, :3] = np.array([
+                [1,  0,  0],
+                [0,  0,  1],
+                [0, -1,  0]
+            ], dtype=np.float32)
+            pose_new = pose @ T_rx
+            axes_img = draw_xyz_axis(axes_img, ob_in_cam=pose_new, scale=0.1, K=K, thickness=3)
 
-        # Add frame index
-        cv2.putText(vis, f"Frame {i}", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,0), 2)
+            depth_rendered = render_mesh_depth(mesh, pose, K, h, w)
+            mesh_mask = depth_rendered > 0
+            obj_mask = mask.astype(bool)
+
+            valid = mesh_mask & obj_mask & (frame_depth > 0)
+            valid &= np.abs(depth_rendered - frame_depth) < 0.02
+
+            depth_error = np.zeros_like(depth_rendered)
+            depth_error[valid] = np.abs(depth_rendered[valid] - frame_depth[valid])
+
+            mean_err = depth_error[valid].mean() if np.any(valid) else np.inf
+            median_err = np.median(depth_error[valid]) if np.any(valid) else np.inf
+            inlier_ratio = np.mean(depth_error[valid] < 0.01) if np.any(valid) else 0.0
+            iou = np.sum(mesh_mask & obj_mask) / np.sum(mesh_mask | obj_mask)
+
+            pose_true = (
+                mean_err * 1000 < 10 and
+                median_err * 1000 < 5 and
+                inlier_ratio > 0.7 and
+                iou > 0.7
+            )
+            if pose_true:
+                all_poses[obj_name].append(pose)
+
+            depth_vis = np.clip(depth_error / 0.02 * 255, 0, 255).astype(np.uint8)
+            depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+
+            cv2.imwrite(str(out_root / f"{obj_name}_frame_{fi}_depth.png"), depth_vis)
+            R_mat = pose[:3, :3]
+            t_vec = pose[:3, 3]
+            results_lines.append(
+                f"  {obj_name}:\n"
+                f"    mean_depth_error_mm: {mean_err*1000:.2f}\n"
+                f"    median_depth_error_mm: {median_err*1000:.2f}\n"
+                f"    inlier_ratio: {inlier_ratio:.3f}\n"
+                f"    silhouette_iou: {iou:.3f}\n"
+                f"    pose_true: {pose_true}\n"
+            )
+            results_lines.append("    pose:\n")
+            results_lines.append("      R:\n")
+            for row in R_mat:
+                results_lines.append(f"        [{row[0]:.6f} {row[1]:.6f} {row[2]:.6f}]\n")
+            results_lines.append(
+                f"      t: [{t_vec[0]:.6f} {t_vec[1]:.6f} {t_vec[2]:.6f}]\n"
+            )
         
-        cv2.imwrite(f"{out_root}/frame_{i}.png", vis)
-        annotated_frames.append(vis)
-        print(f"Saved frame {i}")
+        cv2.imwrite(str(out_root / f"frame_{fi}_mesh.png"), mesh_img)
+        cv2.imwrite(str(out_root / f"frame_{fi}_axes.png"), axes_img)
+        cv2.imwrite(str(out_root / f"frame_{fi}_mask.png"), mask_img)
+        list_images = [mesh_img, axes_img, mask_img]
+        output_float = np.zeros_like(list_images[0], dtype=np.float32)
+        for img in list_images:
+            output_float = output_float + img.astype(np.float32) * (1.0 / len(list_images))
 
-    # Write output_results.txt (pose info)
-    results_path = out_root / "output_results.txt"
-    lines = []
-    lines.append(f"Saved on {datetime.datetime.now().isoformat()}\n\n")
+        final_average_blend = output_float.astype(np.uint8)
+        annotated_frames.append(final_average_blend)
+        results_lines.append("\n")
 
-    poses_by_object = defaultdict(list)
-
-    for fi in range(num_frames):
-        lines.append(f"Frame {fi}:\n")
-        pose_dict = poses_per_frame.get(fi, {})
-        if len(pose_dict) == 0:
-            lines.append("  (no detected objects)\n\n")
+    results_lines.append("\nAveraged poses across all frames:\n")
+    for obj_name, pose_list in all_poses.items():
+        results_lines.append(f"  {obj_name}:\n")
+        if len(pose_list) == 0:
+            results_lines.append("    averaged_pose: None (no valid poses)\n")
             continue
+        translations = np.stack([p[:3, 3] for p in pose_list], axis=0)
+        t_avg = translations.mean(axis=0)
+        rotations = R.from_matrix([p[:3, :3] for p in pose_list])
+        R_avg = rotations.mean().as_matrix()
 
-        for obj_name, pose in pose_dict.items():
-            pose = np.array(pose, dtype=np.float64)
-            R = pose[:3, :3]
-            t = pose[:3, 3]
-            q = rotmat_to_quat(R)
-            rpy = rotmat_to_rpy(R)
+        results_lines.append("    averaged_pose:\n")
+        results_lines.append("      R:\n")
+        for row in R_avg:
+            results_lines.append(f"        [{row[0]:.6f} {row[1]:.6f} {row[2]:.6f}]\n")
+        results_lines.append(f"      t: [{t_avg[0]:.6f} {t_avg[1]:.6f} {t_avg[2]:.6f}]\n")
 
-            lines.append(f"  {obj_name}:\n")
-            lines.append(f"    translation: {t.tolist()}\n")
-            lines.append(f"    rotation_matrix:\n")
-            for row in R.tolist():
-                lines.append(f"      {row}\n")
-            lines.append(f"    rpy_degrees (roll,pitch,yaw): {rpy.tolist()}\n")
-            lines.append(f"    quaternion (x,y,z,w): {q.tolist()}\n")
+    with open(out_root / "output_results.txt", "w") as f:
+        f.writelines(results_lines)
 
-            poses_by_object[obj_name].append((fi, pose))
-        lines.append("\n")
+    return annotated_frames
 
-    # Averaged poses
-    lines.append("Final Averaged Poses:\n")
-    for obj_name, plist in poses_by_object.items():
-        translations = np.array([p[1][:3,3] for p in plist])
-        t_mean = np.mean(translations, axis=0)
-        quats = np.array([rotmat_to_quat(p[1][:3,:3]) for p in plist])
-        q_avg = average_quaternions(quats)
-        R_avg = quat_to_rotmat(q_avg)
-        rpy_avg = rotmat_to_rpy(R_avg)
-
-        pose_avg = np.eye(4)
-        pose_avg[:3,:3] = R_avg
-        pose_avg[:3,3] = t_mean
-
-        lines.append(f"  {obj_name}:\n")
-        lines.append(f"    mean_translation: {t_mean.tolist()}\n")
-        lines.append(f"    avg_rotation_matrix:\n")
-        for row in R_avg.tolist():
-            lines.append(f"      {row}\n")
-        lines.append(f"    avg_rpy_degrees (roll,pitch,yaw): {rpy_avg.tolist()}\n")
-        lines.append(f"    avg_quaternion (x,y,z,w): {q_avg.tolist()}\n")
-        lines.append(f"    avg_pose_4x4:\n")
-        for row in pose_avg.tolist():
-            lines.append(f"      {row}\n")
-        lines.append("\n")
-
-    with open(results_path, 'w') as fh:
-        fh.writelines(lines)
-
-    print(f"Wrote pose results summary to {results_path}")
-
-    return annotated_frames  # return images for ROS publishing
 
 # -------------------------------------------------------------
 # Mask utility: centroid
@@ -413,6 +395,111 @@ def compute_yaw_from_pca(dx, dy):
     angle_rad = np.arctan2(dx, -dy)
     angle_deg = np.degrees(angle_rad)
     return angle_deg
+
+
+###
+### Human Movement Detection
+###
+class HumanMovementDetector:
+    def __init__(self, movement_threshold=0.5):
+        self.mp_pose = mediapipe.solutions.pose
+        self.pose_detector = self.mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.last_torso_pos = None
+        self.last_time = None
+        self.moving = False
+        self.velocity = 0.0
+        self.human_present = False
+        self.movement_threshold = movement_threshold
+
+    def detect(self, rgb_frame, depth_frame):
+        if rgb_frame is None or depth_frame is None:
+            self.human_present = False
+            self.moving = False
+            self.velocity = 0.0
+            return self.human_present, self.moving, self.velocity
+
+        frame_rgb = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2RGB)
+        results = self.pose_detector.process(frame_rgb)
+
+        if not results.pose_landmarks:
+            self.human_present = False
+            self.moving = False
+            self.velocity = 0.0
+            self.last_torso_pos = None
+            self.last_time = None
+            return self.human_present, self.moving, self.velocity
+
+        self.human_present = True
+        lm = results.pose_landmarks.landmark
+
+        torso_x = (
+            lm[self.mp_pose.PoseLandmark.LEFT_SHOULDER].x +
+            lm[self.mp_pose.PoseLandmark.RIGHT_SHOULDER].x +
+            lm[self.mp_pose.PoseLandmark.LEFT_HIP].x +
+            lm[self.mp_pose.PoseLandmark.RIGHT_HIP].x
+        ) / 4
+
+        torso_y = (
+            lm[self.mp_pose.PoseLandmark.LEFT_SHOULDER].y +
+            lm[self.mp_pose.PoseLandmark.RIGHT_SHOULDER].y +
+            lm[self.mp_pose.PoseLandmark.LEFT_HIP].y +
+            lm[self.mp_pose.PoseLandmark.RIGHT_HIP].y
+        ) / 4
+
+        h, w = rgb_frame.shape[:2]
+        cx = np.clip(int(torso_x * w), 0, w - 1)
+        cy = np.clip(int(torso_y * h), 0, h - 1)
+
+        depth_value = float(depth_frame[cy, cx])
+
+        now = time.time()
+
+        if self.last_torso_pos is not None and self.last_time is not None and depth_value > 0:
+            dx = cx - self.last_torso_pos[0]
+            dy = cy - self.last_torso_pos[1]
+            pixel_dist = np.sqrt(dx * dx + dy * dy)
+            metric_dist = pixel_dist * (depth_value / max(w, h))
+            dt = now - self.last_time
+            self.velocity = metric_dist / dt if dt > 0 else 0.0
+            self.moving = self.velocity > self.movement_threshold
+        else:
+            self.moving = False
+            self.velocity = 0.0
+
+        self.last_torso_pos = (cx, cy)
+        self.last_time = now
+
+        return self.human_present, self.moving, self.velocity
+
+def render_mesh_depth(mesh, pose_cv, K, H, W):
+    scene = pyrender.Scene(bg_color=[0, 0, 0, 0])
+
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    cam = pyrender.IntrinsicsCamera(fx, fy, cx, cy)
+    scene.add(cam, pose=np.eye(4))
+    cv_to_gl = np.array([
+        [1,  0,  0, 0],
+        [0, -1,  0, 0],
+        [0,  0, -1, 0],
+        [0,  0,  0, 1]
+    ])
+    pose_gl = cv_to_gl @ pose_cv
+    mesh_node = pyrender.Mesh.from_trimesh(mesh, smooth=False)
+    scene.add(mesh_node, pose=pose_gl)
+    r = pyrender.OffscreenRenderer(W, H)
+    depth = r.render(scene, flags=pyrender.RenderFlags.DEPTH_ONLY)
+    r.delete()
+    print("Rendered depth stats:",
+      np.min(depth),
+      np.max(depth),
+      np.count_nonzero(depth))
+    return depth
 
 
 ### MATHS ####
